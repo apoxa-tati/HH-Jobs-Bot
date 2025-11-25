@@ -88,10 +88,6 @@ class SearchSettingsStates(StatesGroup):
     waiting_for_position = State()
     waiting_for_city = State()
     waiting_for_salary = State()
-    waiting_for_employment = State()
-    waiting_for_experience = State()
-    waiting_for_company_type = State()
-    waiting_for_freshness = State()
 
 class DatabaseService:
     @staticmethod
@@ -200,10 +196,6 @@ class DatabaseService:
                 'position': settings.get('position'),
                 'city': settings.get('city'),
                 'min_salary': settings.get('min_salary'),
-                'employment_type': settings.get('employment_type'),
-                'experience': settings.get('experience'),
-                'company_type': settings.get('company_type', 'any'),
-                'fresh_only': settings.get('fresh_only', True),
                 'updated_at': datetime.utcnow().isoformat()
             }
             
@@ -253,13 +245,14 @@ class HHService:
         params = {
             'text': search_params.get('position', ''),
             'area': await HHService.get_area_id(search_params.get('city', 'Москва')),
-            'per_page': 5,  # Уменьшил для тестирования
+            'per_page': 5,
             'page': 0
         }
         
         if search_params.get('min_salary'):
             params['salary'] = search_params['min_salary']
-            params['only_with_salary'] = True
+            # Исправляем: передаем 1 вместо True
+            params['only_with_salary'] = 1
         
         try:
             logger.info(f"🔍 Поиск вакансий с параметрами: {params}")
@@ -306,6 +299,30 @@ class HHService:
                 f"💰 Зарплата: {salary_text}\n"
                 f"🔗 {url}")
 
+async def perform_vacancy_search(user_id: int, settings: dict, message: types.Message):
+    """Функция для выполнения поиска вакансий и отправки результатов"""
+    await message.answer("🔍 Ищу вакансии по вашим настройкам...")
+    
+    vacancies = await HHService.search_vacancies(settings)
+    
+    if vacancies:
+        response = f"📋 Найдено вакансий: {len(vacancies)}\n\n"
+        for i, vacancy in enumerate(vacancies, 1):
+            response += f"{i}. {HHService.format_vacancy(vacancy)}\n\n"
+        
+        # Разбиваем длинные сообщения на части
+        if len(response) > 4000:
+            parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
+            for part in parts:
+                await message.answer(part)
+        else:
+            await message.answer(response)
+    else:
+        await message.answer(
+            "😔 По вашим настройкам ничего не найдено\n"
+            "Попробуйте изменить параметры: /search"
+        )
+
 @dp.message(Command("start"))
 async def start_handler(message: types.Message, state: FSMContext):
     user = await DatabaseService.get_user(message.from_user.id)
@@ -314,8 +331,8 @@ async def start_handler(message: types.Message, state: FSMContext):
         await message.answer(
             f"С возвращением, {user.get('full_name', 'друг')}! 👋\n\n"
             f"Используйте:\n"
-            f"/search_settings - настройки поиска\n"
-            f"/search - поиск вакансий\n"
+            f"/search - настройки поиска\n"
+            f"/find - поиск вакансий\n"
             f"/profile - ваш профиль\n"
             f"/help - помощь"
         )
@@ -382,13 +399,13 @@ async def process_resume(message: types.Message, state: FSMContext):
                 f"🏙️ {user_data['city']}\n"
                 f"💼 {user_data['desired_position']}\n"
                 f"🛠️ Навыки: {user_data['skills']}\n\n"
-                f"Теперь настройте поиск вакансий: /search_settings"
+                f"Теперь настройте поиск вакансий: /search"
             )
         else:
             await message.answer(
                 "❌ Не удалось сохранить профиль.\n"
                 "Но вы можете продолжить работу!\n"
-                "Используйте /search_settings для настройки поиска"
+                "Используйте /search для настройки поиска"
             )
         
         await state.clear()
@@ -398,7 +415,7 @@ async def process_resume(message: types.Message, state: FSMContext):
         await message.answer(
             "❌ Произошла непредвиденная ошибка.\n"
             "Попробуйте снова: /start\n\n"
-            "Или используйте /search_settings для настройки поиска"
+            "Или используйте /search для настройки поиска"
         )
         await state.clear()
 
@@ -417,10 +434,10 @@ async def profile_handler(message: types.Message):
         f"💼 Должность: {user.get('desired_position', 'Не указана')}\n"
         f"🛠️ Навыки: {user.get('skills', 'Не указаны')}\n"
         f"📄 Резюме: {user.get('resume', 'Не указано')}\n\n"
-        f"Настроить поиск: /search_settings"
+        f"Настроить поиск: /search"
     )
 
-@dp.message(Command("search_settings"))
+@dp.message(Command("search"))
 async def search_settings_handler(message: types.Message, state: FSMContext):
     await message.answer(
         "🔍 Настройка поиска вакансий\n\n"
@@ -456,40 +473,29 @@ async def process_search_salary(message: types.Message, state: FSMContext):
         
         await message.answer(
             "✅ Базовые настройки сохранены!\n\n"
-            "Теперь используйте /search для поиска вакансий\n\n"
-            "Расширенные настройки будут добавлены позже"
+            "🔍 Начинаю поиск вакансий..."
         )
+        
+        # АВТОМАТИЧЕСКИ ЗАПУСКАЕМ ПОИСК ВАКАНСИЙ ПОСЛЕ СОХРАНЕНИЯ ВСЕХ ДАННЫХ
+        await perform_vacancy_search(message.from_user.id, search_data, message)
         
         await state.clear()
     except ValueError:
         await message.answer("Пожалуйста, введите число для зарплаты:")
 
-@dp.message(Command("search"))
+@dp.message(Command("find"))
 async def search_handler(message: types.Message):
     settings = await DatabaseService.get_search_settings(message.from_user.id)
     
     if not settings:
         await message.answer(
             "❌ У вас нет сохраненных настроек поиска.\n"
-            "Сначала настройте параметры: /search_settings"
+            "Сначала настройте параметры: /search"
         )
         return
     
-    await message.answer("🔍 Ищу вакансии по вашим настройкам...")
-    
-    vacancies = await HHService.search_vacancies(settings)
-    
-    if vacancies:
-        response = f"📋 Найдено вакансий: {len(vacancies)}\n\n"
-        for i, vacancy in enumerate(vacancies, 1):
-            response += f"{i}. {HHService.format_vacancy(vacancy)}\n\n"
-        
-        await message.answer(response)
-    else:
-        await message.answer(
-            "😔 По вашим настройкам ничего не найдено\n"
-            "Попробуйте изменить параметры: /search_settings"
-        )
+    # Запускаем поиск вакансий по сохраненным настройкам
+    await perform_vacancy_search(message.from_user.id, settings, message)
 
 @dp.message(Command("help"))
 async def help_handler(message: types.Message):
@@ -498,8 +504,8 @@ async def help_handler(message: types.Message):
         "Основные команды:\n"
         "/start - регистрация/профиль\n"
         "/profile - мой профиль\n"
-        "/search_settings - настройки поиска\n"
-        "/search - поиск вакансий\n"
+        "/search - настройки поиска (автоматически запускает поиск)\n"
+        "/find - поиск вакансий по сохраненным настройкам\n"
         "/help - помощь\n\n"
         "Бот найдет для вас актуальные вакансии с hh.ru!"
     )
@@ -511,7 +517,7 @@ async def text_handler(message: types.Message):
     if text in ['привет', 'hello', 'hi']:
         await message.answer("Привет! 👋 Используйте /start для начала работы")
     elif any(word in text for word in ['ваканси', 'работа', 'поиск']):
-        await message.answer("Используйте /search_settings для настройки поиска")
+        await message.answer("Используйте /search для настройки поиска")
     elif text.startswith('/'):
         await message.answer(f"Команда {message.text} не найдена. Используйте /help")
     else:
@@ -519,6 +525,17 @@ async def text_handler(message: types.Message):
             "Не понял ваш запрос 🤔\n"
             "Используйте /help для списка команд"
         )
+
+async def set_bot_commands(bot: Bot):
+    """Устанавливаем команды бота для меню"""
+    commands = [
+        types.BotCommand(command="start", description="Начать работу"),
+        types.BotCommand(command="search", description="Настройки поиска"),
+        types.BotCommand(command="find", description="Поиск вакансий"),
+        types.BotCommand(command="profile", description="Мой профиль"),
+        types.BotCommand(command="help", description="Помощь"),
+    ]
+    await bot.set_my_commands(commands)
 
 async def main():
     bot_token = os.getenv('TG_BOT_API_KEY')
@@ -528,6 +545,10 @@ async def main():
         return
     
     bot = Bot(token=bot_token)
+    
+    # Устанавливаем команды бота
+    await set_bot_commands(bot)
+    
     logger.info("🚀 Бот запускается...")
     
     try:
