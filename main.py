@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 import os
 
@@ -10,7 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 import aiohttp
 from dotenv import load_dotenv
-from supabase import Client, create_client
+from supabase import create_client
 
 
 # Загружаем переменные из .env
@@ -23,7 +23,53 @@ logger = logging.getLogger(__name__)
 # Инициализация Supabase
 supabase_url = os.getenv('SUPABASE_URL')
 supabase_key = os.getenv('SUPABASE_KEY')
-supabase: Client = create_client(supabase_url, supabase_key)
+
+# Временное хранилище в памяти (на случай проблем с Supabase)
+class TempStorage:
+    def __init__(self):
+        self.users = {}
+        self.search_settings = {}
+    
+    async def save_user_temp(self, telegram_id: int, **data):
+        try:
+            self.users[telegram_id] = {
+                **data,
+                'created_at': datetime.utcnow().isoformat()
+            }
+            logger.info(f"✅ Пользователь {telegram_id} сохранен во временное хранилище")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка временного сохранения: {e}")
+            return False
+    
+    async def get_user_temp(self, telegram_id: int):
+        return self.users.get(telegram_id)
+    
+    async def save_search_settings_temp(self, user_id: int, settings: dict):
+        try:
+            self.search_settings[user_id] = settings
+            logger.info(f"✅ Настройки поиска для {user_id} сохранены во временное хранилище")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения настроек: {e}")
+            return False
+    
+    async def get_search_settings_temp(self, user_id: int):
+        return self.search_settings.get(user_id)
+
+temp_storage = TempStorage()
+
+# Пытаемся подключиться к Supabase
+supabase = None
+try:
+    if supabase_url and supabase_key:
+        supabase = create_client(supabase_url, supabase_key)
+        logger.info("✅ Supabase клиент успешно создан")
+    else:
+        logger.warning("⚠️ SUPABASE_URL или SUPABASE_KEY не найдены, используем временное хранилище")
+except Exception as e:
+    logger.error(f"❌ Ошибка создания Supabase клиента: {e}")
+    logger.warning("⚠️ Используем временное хранилище вместо Supabase")
 
 # Создаем диспетчер с хранилищем
 storage = MemoryStorage()
@@ -53,6 +99,19 @@ class DatabaseService:
                        desired_position: str = None, skills: str = None, resume: str = None):
         """Сохраняем/обновляем пользователя в Supabase"""
         try:
+            if not supabase:
+                logger.warning("Supabase не доступен, используем временное хранилище")
+                return await temp_storage.save_user_temp(
+                    telegram_id, 
+                    full_name=full_name, 
+                    city=city, 
+                    desired_position=desired_position, 
+                    skills=skills, 
+                    resume=resume
+                )
+            
+            logger.info(f"🔄 Сохранение пользователя {telegram_id} в Supabase")
+            
             # Проверяем, есть ли уже пользователь
             existing = supabase.table('users')\
                 .select('*')\
@@ -70,44 +129,67 @@ class DatabaseService:
             }
             
             if existing.data:
-                # Обновляем существующего пользователя
+                logger.info(f"📝 Обновление существующего пользователя {telegram_id}")
                 result = supabase.table('users')\
                     .update(user_data)\
                     .eq('telegram_id', telegram_id)\
                     .execute()
             else:
-                # Создаем нового пользователя
+                logger.info(f"🆕 Создание нового пользователя {telegram_id}")
                 user_data['created_at'] = datetime.utcnow().isoformat()
                 result = supabase.table('users')\
                     .insert(user_data)\
                     .execute()
             
+            logger.info(f"✅ Пользователь {telegram_id} успешно сохранен в Supabase")
             return True
+            
         except Exception as e:
-            logger.error(f"Error saving user: {e}")
-            return False
+            logger.error(f"❌ Ошибка сохранения пользователя в Supabase: {e}")
+            logger.warning("🔄 Пробуем сохранить во временное хранилище")
+            return await temp_storage.save_user_temp(
+                telegram_id, 
+                full_name=full_name, 
+                city=city, 
+                desired_position=desired_position, 
+                skills=skills, 
+                resume=resume
+            )
 
     @staticmethod
     async def get_user(telegram_id: int):
-        """Получаем пользователя из Supabase"""
+        """Получаем пользователя из Supabase или временного хранилища"""
         try:
-            result = supabase.table('users')\
-                .select('*')\
-                .eq('telegram_id', telegram_id)\
-                .execute()
+            if supabase:
+                result = supabase.table('users')\
+                    .select('*')\
+                    .eq('telegram_id', telegram_id)\
+                    .execute()
+                
+                if result.data:
+                    logger.info(f"✅ Пользователь {telegram_id} найден в Supabase")
+                    return result.data[0]
             
-            if result.data:
-                return result.data[0]
-            return None
+            # Если не нашли в Supabase, ищем во временном хранилище
+            user = await temp_storage.get_user_temp(telegram_id)
+            if user:
+                logger.info(f"✅ Пользователь {telegram_id} найден во временном хранилище")
+            else:
+                logger.info(f"❌ Пользователь {telegram_id} не найден")
+                
+            return user
+            
         except Exception as e:
-            logger.error(f"Error getting user: {e}")
-            return None
+            logger.error(f"❌ Ошибка получения пользователя: {e}")
+            return await temp_storage.get_user_temp(telegram_id)
 
     @staticmethod
     async def save_search_settings(user_id: int, settings: dict):
-        """Сохраняем настройки поиска в Supabase"""
+        """Сохраняем настройки поиска"""
         try:
-            # Проверяем, есть ли уже настройки для этого пользователя
+            if not supabase:
+                return await temp_storage.save_search_settings_temp(user_id, settings)
+            
             existing = supabase.table('search_settings')\
                 .select('*')\
                 .eq('user_id', user_id)\
@@ -126,38 +208,41 @@ class DatabaseService:
             }
             
             if existing.data:
-                # Обновляем существующие настройки
                 result = supabase.table('search_settings')\
                     .update(settings_data)\
                     .eq('user_id', user_id)\
                     .execute()
             else:
-                # Создаем новые настройки
                 settings_data['created_at'] = datetime.utcnow().isoformat()
                 result = supabase.table('search_settings')\
                     .insert(settings_data)\
                     .execute()
             
+            logger.info(f"✅ Настройки поиска для {user_id} сохранены в Supabase")
             return True
+            
         except Exception as e:
-            logger.error(f"Error saving search settings: {e}")
-            return False
+            logger.error(f"❌ Ошибка сохранения настроек в Supabase: {e}")
+            return await temp_storage.save_search_settings_temp(user_id, settings)
 
     @staticmethod
     async def get_search_settings(user_id: int):
-        """Получаем настройки поиска из Supabase"""
+        """Получаем настройки поиска"""
         try:
-            result = supabase.table('search_settings')\
-                .select('*')\
-                .eq('user_id', user_id)\
-                .execute()
+            if supabase:
+                result = supabase.table('search_settings')\
+                    .select('*')\
+                    .eq('user_id', user_id)\
+                    .execute()
+                
+                if result.data:
+                    return result.data[0]
             
-            if result.data:
-                return result.data[0]
-            return None
+            return await temp_storage.get_search_settings_temp(user_id)
+            
         except Exception as e:
-            logger.error(f"Error getting search settings: {e}")
-            return None
+            logger.error(f"❌ Ошибка получения настроек: {e}")
+            return await temp_storage.get_search_settings_temp(user_id)
 
 class HHService:
     @staticmethod
@@ -165,86 +250,43 @@ class HHService:
         """Поиск вакансий через HH API с фильтрами"""
         url = "https://api.hh.ru/vacancies"
         
-        # Базовые параметры
         params = {
             'text': search_params.get('position', ''),
             'area': await HHService.get_area_id(search_params.get('city', 'Москва')),
-            'per_page': 10,
+            'per_page': 5,  # Уменьшил для тестирования
             'page': 0
         }
         
-        # Фильтр по зарплате
         if search_params.get('min_salary'):
             params['salary'] = search_params['min_salary']
             params['only_with_salary'] = True
         
-        # Фильтр по типу занятости
-        employment_map = {
-            'full': 'full',
-            'part': 'part', 
-            'remote': 'remote'
-        }
-        if search_params.get('employment_type') in employment_map:
-            params['employment'] = employment_map[search_params['employment_type']]
-        
-        # Фильтр по опыту
-        experience_map = {
-            'no_exp': 'noExperience',
-            '1-3': 'between1And3',
-            '3-6': 'between3And6',
-            '6+': 'moreThan6'
-        }
-        if search_params.get('experience') in experience_map:
-            params['experience'] = experience_map[search_params['experience']]
-        
-        # Фильтр по свежести (1-3 дня)
-        if search_params.get('fresh_only', True):
-            date_from = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
-            params['date_from'] = date_from
-        
-        # Фильтр по типу компании
-        if search_params.get('company_type') == 'direct':
-            params['employer_type'] = 'direct'
-        
         try:
+            logger.info(f"🔍 Поиск вакансий с параметрами: {params}")
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, params=params) as response:
                     if response.status == 200:
                         data = await response.json()
-                        return data.get('items', [])
+                        vacancies = data.get('items', [])
+                        logger.info(f"✅ Найдено вакансий: {len(vacancies)}")
+                        return vacancies
                     else:
-                        logger.error(f"HH API error: {response.status}")
+                        logger.error(f"❌ Ошибка HH API: {response.status}")
                         return []
         except Exception as e:
-            logger.error(f"Error fetching vacancies: {e}")
+            logger.error(f"❌ Ошибка при поиске вакансий: {e}")
             return []
 
     @staticmethod
     async def get_area_id(city_name: str) -> int:
-        """Получение ID города для HH API"""
         area_map = {
-            'москва': 1,
-            'санкт-петербург': 2,
-            'екатеринбург': 3,
-            'новосибирск': 4,
-            'казань': 88,
-            'нижний новгород': 66,
-            'красноярск': 54,
-            'челябинск': 104,
-            'самара': 78,
-            'уфа': 99,
-            'ростов-на-дону': 76,
-            'краснодар': 53,
-            'омск': 68,
-            'воронеж': 26,
-            'пермь': 72,
-            'волгоград': 24
+            'москва': 1, 'санкт-петербург': 2, 'екатеринбург': 3,
+            'новосибирск': 4, 'казань': 88, 'нижний новгород': 66,
         }
         return area_map.get(city_name.lower(), 1)
 
     @staticmethod
     def format_vacancy(vacancy):
-        """Форматирование вакансии для отправки"""
         title = vacancy.get('name', 'Без названия')
         company = vacancy.get('employer', {}).get('name', 'Не указано')
         salary = vacancy.get('salary')
@@ -258,31 +300,28 @@ class HHService:
             salary_text = "Не указана"
             
         url = vacancy.get('alternate_url', '#')
-        published = vacancy.get('published_at', '')[:10]
         
         return (f"🏢 {title}\n"
                 f"📊 Компания: {company}\n"
                 f"💰 Зарплата: {salary_text}\n"
-                f"📅 Опубликована: {published}\n"
                 f"🔗 {url}")
 
 @dp.message(Command("start"))
 async def start_handler(message: types.Message, state: FSMContext):
-    """Начало регистрации пользователя"""
     user = await DatabaseService.get_user(message.from_user.id)
     
     if user:
         await message.answer(
             f"С возвращением, {user.get('full_name', 'друг')}! 👋\n\n"
-            f"Ваш профиль уже настроен.\n"
-            f"Посмотреть настройки: /profile\n"
-            f"Настроить поиск: /search_settings\n"
-            f"Найти вакансии: /search"
+            f"Используйте:\n"
+            f"/search_settings - настройки поиска\n"
+            f"/search - поиск вакансий\n"
+            f"/profile - ваш профиль\n"
+            f"/help - помощь"
         )
     else:
         await message.answer(
             "👋 Добро пожаловать в HH Bot!\n\n"
-            "Я помогу вам найти работу на hh.ru с персонализированными рекомендациями.\n\n"
             "Давайте зарегистрируем ваш профиль. Как вас зовут?\n"
             "(Фамилия и имя)"
         )
@@ -305,8 +344,7 @@ async def process_position(message: types.Message, state: FSMContext):
     await state.update_data(desired_position=message.text)
     await message.answer(
         "Перечислите ваши ключевые навыки:\n"
-        "(например: Python, Django, PostgreSQL, Docker)\n\n"
-        "Можно через запятую или списком"
+        "(например: Python, Django, PostgreSQL, Docker)"
     )
     await state.set_state(RegistrationStates.waiting_for_skills)
 
@@ -315,44 +353,57 @@ async def process_skills(message: types.Message, state: FSMContext):
     await state.update_data(skills=message.text)
     await message.answer(
         "Напишите краткое резюме о себе:\n"
-        "(опыт работы, образование, достижения)\n\n"
-        "Это поможет мне генерировать адаптированные сопроводительные письма"
+        "(опыт работы, образование, достижения)"
     )
     await state.set_state(RegistrationStates.waiting_for_resume)
 
 @dp.message(RegistrationStates.waiting_for_resume)
 async def process_resume(message: types.Message, state: FSMContext):
-    user_data = await state.get_data()
-    
-    # Сохраняем пользователя в базу
-    success = await DatabaseService.save_user(
-        telegram_id=message.from_user.id,
-        full_name=user_data['full_name'],
-        city=user_data['city'],
-        desired_position=user_data['desired_position'],
-        skills=user_data['skills'],
-        resume=message.text
-    )
-    
-    if success:
-        await message.answer(
-            f"✅ Регистрация завершена!\n\n"
-            f"📋 Ваш профиль:\n"
-            f"👤 {user_data['full_name']}\n"
-            f"🏙️ {user_data['city']}\n"
-            f"💼 {user_data['desired_position']}\n"
-            f"🛠️ Навыки: {user_data['skills']}\n\n"
-            f"Теперь настройте поиск вакансий: /search_settings\n"
-            f"Или посмотрите ваш профиль: /profile"
+    try:
+        user_data = await state.get_data()
+        user_data['resume'] = message.text
+        
+        logger.info(f"🔄 Сохранение пользователя {message.from_user.id}")
+        
+        success = await DatabaseService.save_user(
+            telegram_id=message.from_user.id,
+            full_name=user_data['full_name'],
+            city=user_data['city'],
+            desired_position=user_data['desired_position'],
+            skills=user_data['skills'],
+            resume=user_data['resume']
         )
-    else:
-        await message.answer("❌ Ошибка сохранения профиля. Попробуйте снова: /start")
-    
-    await state.clear()
+        
+        if success:
+            await message.answer(
+                f"✅ Регистрация завершена!\n\n"
+                f"📋 Ваш профиль:\n"
+                f"👤 {user_data['full_name']}\n"
+                f"🏙️ {user_data['city']}\n"
+                f"💼 {user_data['desired_position']}\n"
+                f"🛠️ Навыки: {user_data['skills']}\n\n"
+                f"Теперь настройте поиск вакансий: /search_settings"
+            )
+        else:
+            await message.answer(
+                "❌ Не удалось сохранить профиль.\n"
+                "Но вы можете продолжить работу!\n"
+                "Используйте /search_settings для настройки поиска"
+            )
+        
+        await state.clear()
+        
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка в process_resume: {e}")
+        await message.answer(
+            "❌ Произошла непредвиденная ошибка.\n"
+            "Попробуйте снова: /start\n\n"
+            "Или используйте /search_settings для настройки поиска"
+        )
+        await state.clear()
 
 @dp.message(Command("profile"))
 async def profile_handler(message: types.Message):
-    """Показываем профиль пользователя"""
     user = await DatabaseService.get_user(message.from_user.id)
     
     if not user:
@@ -363,67 +414,111 @@ async def profile_handler(message: types.Message):
         f"📋 Ваш профиль:\n\n"
         f"👤 Имя: {user.get('full_name', 'Не указано')}\n"
         f"🏙️ Город: {user.get('city', 'Не указан')}\n"
-        f"💼 Желаемая должность: {user.get('desired_position', 'Не указана')}\n"
+        f"💼 Должность: {user.get('desired_position', 'Не указана')}\n"
         f"🛠️ Навыки: {user.get('skills', 'Не указаны')}\n"
-        f"📄 Резюме: {user.get('resume', 'Не указано')[:200]}...\n\n"
-        f"Изменить настройки поиска: /search_settings\n"
-        f"Найти вакансии: /search"
+        f"📄 Резюме: {user.get('resume', 'Не указано')}\n\n"
+        f"Настроить поиск: /search_settings"
     )
+
+@dp.message(Command("search_settings"))
+async def search_settings_handler(message: types.Message, state: FSMContext):
+    await message.answer(
+        "🔍 Настройка поиска вакансий\n\n"
+        "Какую должность вы ищете?\n"
+        "Например: Тестировщик"
+    )
+    await state.set_state(SearchSettingsStates.waiting_for_position)
+
+@dp.message(SearchSettingsStates.waiting_for_position)
+async def process_search_position(message: types.Message, state: FSMContext):
+    await state.update_data(position=message.text)
+    await message.answer("В каком городе ищете работу?\nНапример: Санкт-Петербург")
+    await state.set_state(SearchSettingsStates.waiting_for_city)
+
+@dp.message(SearchSettingsStates.waiting_for_city)
+async def process_search_city(message: types.Message, state: FSMContext):
+    await state.update_data(city=message.text)
+    await message.answer(
+        "Укажите минимальную зарплату (руб):\n"
+        "Или напишите 0, если не важно"
+    )
+    await state.set_state(SearchSettingsStates.waiting_for_salary)
+
+@dp.message(SearchSettingsStates.waiting_for_salary)
+async def process_search_salary(message: types.Message, state: FSMContext):
+    try:
+        salary = int(message.text)
+        await state.update_data(min_salary=salary if salary > 0 else None)
+        
+        # Сохраняем базовые настройки
+        search_data = await state.get_data()
+        await DatabaseService.save_search_settings(message.from_user.id, search_data)
+        
+        await message.answer(
+            "✅ Базовые настройки сохранены!\n\n"
+            "Теперь используйте /search для поиска вакансий\n\n"
+            "Расширенные настройки будут добавлены позже"
+        )
+        
+        await state.clear()
+    except ValueError:
+        await message.answer("Пожалуйста, введите число для зарплаты:")
+
+@dp.message(Command("search"))
+async def search_handler(message: types.Message):
+    settings = await DatabaseService.get_search_settings(message.from_user.id)
+    
+    if not settings:
+        await message.answer(
+            "❌ У вас нет сохраненных настроек поиска.\n"
+            "Сначала настройте параметры: /search_settings"
+        )
+        return
+    
+    await message.answer("🔍 Ищу вакансии по вашим настройкам...")
+    
+    vacancies = await HHService.search_vacancies(settings)
+    
+    if vacancies:
+        response = f"📋 Найдено вакансий: {len(vacancies)}\n\n"
+        for i, vacancy in enumerate(vacancies, 1):
+            response += f"{i}. {HHService.format_vacancy(vacancy)}\n\n"
+        
+        await message.answer(response)
+    else:
+        await message.answer(
+            "😔 По вашим настройкам ничего не найдено\n"
+            "Попробуйте изменить параметры: /search_settings"
+        )
 
 @dp.message(Command("help"))
 async def help_handler(message: types.Message):
     await message.answer(
-        "Я помогу вам с поиском работы на HH.ru!\n\n"
-        "Функции:\n"
-        "• Персонализированный поиск вакансий\n"
-        "• Ежедневные уведомления\n"
-        "• Настройка фильтров\n\n"
+        "🤖 Помощь по боту:\n\n"
         "Основные команды:\n"
         "/start - регистрация/профиль\n"
         "/profile - мой профиль\n"
         "/search_settings - настройки поиска\n"
-        "/search - поиск по настройкам\n"
-        "/my_settings - мои настройки поиска"
+        "/search - поиск вакансий\n"
+        "/help - помощь\n\n"
+        "Бот найдет для вас актуальные вакансии с hh.ru!"
     )
 
-@dp.message(Command("my_settings"))
-async def my_settings_handler(message: types.Message):
-    """Показываем текущие настройки пользователя"""
-    settings = await DatabaseService.get_search_settings(message.from_user.id)
+@dp.message()
+async def text_handler(message: types.Message):
+    text = message.text.lower()
     
-    if not settings:
-        await message.answer("❌ У вас нет сохраненных настроек поиска.\n"
-                           "Используйте /search_settings для настройки")
-        return
-    
-    employment_text = {
-        'full': 'Полная занятость',
-        'part': 'Частичная занятость', 
-        'remote': 'Удаленная работа'
-    }.get(settings['employment_type'], 'Не указано')
-    
-    experience_text = {
-        'no_exp': 'Нет опыта',
-        '1-3': '1-3 года',
-        '3-6': '3-6 лет',
-        '6+': 'Более 6 лет'
-    }.get(settings['experience'], 'Не указано')
-    
-    await message.answer(
-        f"⚙️ Ваши настройки поиска:\n\n"
-        f"💼 Должность: {settings.get('position', 'Не указана')}\n"
-        f"🏙️ Город: {settings.get('city', 'Не указан')}\n"
-        f"💰 Зарплата от: {settings.get('min_salary', 'Не важно')} руб\n"
-        f"🕒 Тип занятости: {employment_text}\n"
-        f"👨‍💻 Опыт: {experience_text}\n"
-        f"🏢 Тип компании: {settings.get('company_type', 'Любой')}\n"
-        f"🕐 Свежие вакансии: {'Да' if settings.get('fresh_only') else 'Нет'}\n\n"
-        f"Изменить настройки: /search_settings\n"
-        f"Найти вакансии: /search"
-    )
-
-# ... (остальной код search_settings и search такой же как в предыдущем сообщении)
-# [Здесь должен быть код для search_settings и search из предыдущего сообщения]
+    if text in ['привет', 'hello', 'hi']:
+        await message.answer("Привет! 👋 Используйте /start для начала работы")
+    elif any(word in text for word in ['ваканси', 'работа', 'поиск']):
+        await message.answer("Используйте /search_settings для настройки поиска")
+    elif text.startswith('/'):
+        await message.answer(f"Команда {message.text} не найдена. Используйте /help")
+    else:
+        await message.answer(
+            "Не понял ваш запрос 🤔\n"
+            "Используйте /help для списка команд"
+        )
 
 async def main():
     bot_token = os.getenv('TG_BOT_API_KEY')
@@ -432,17 +527,13 @@ async def main():
         logger.error("❌ TG_BOT_API_KEY не найден в .env файле!")
         return
     
-    if not supabase_url or not supabase_key:
-        logger.error("❌ SUPABASE_URL или SUPABASE_KEY не найдены в .env файле!")
-        return
-    
     bot = Bot(token=bot_token)
-    logger.info("Бот запускается...")
+    logger.info("🚀 Бот запускается...")
     
     try:
         await dp.start_polling(bot)
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
+        logger.error(f"❌ Ошибка: {e}")
     finally:
         await bot.session.close()
 
